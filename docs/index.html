@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Yahoo Finance — On-Demand History Scraper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-weight: 600; margin-bottom: 4px; margin-top: 12px; }
+  input { width: 100%; padding: 8px; box-sizing: border-box; font-size: 1rem; }
+  button { margin-top: 16px; padding: 10px 18px; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #log { white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; background: #8881; padding: 10px; border-radius: 6px; min-height: 40px; }
+  .hint { font-size: 0.85rem; opacity: 0.75; }
+  a.download { display: block; margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Yahoo Finance — On-Demand History Scraper</h1>
+<p class="hint">
+  Enter a ticker and this page triggers the <code>scrape-on-demand</code> GitHub Action,
+  which runs the Playwright scraper and commits the resulting CSV back to this repo.
+  Your token is only ever held in this browser's <code>localStorage</code> and sent
+  straight to the GitHub API — it is never committed to the repo. See the
+  <a href="https://github.com/Evaline8485/YahooFinScraper#readme">README</a> for which
+  permissions the token needs.
+</p>
+
+<fieldset>
+  <legend>Access</legend>
+  <label for="token">GitHub fine-grained PAT</label>
+  <input id="token" type="password" placeholder="github_pat_...">
+  <p class="hint">Needs <strong>Actions: Read and write</strong> and <strong>Contents: Read-only</strong> on this repo only.</p>
+</fieldset>
+
+<fieldset>
+  <legend>Query</legend>
+  <label for="symbol">Ticker symbol</label>
+  <input id="symbol" placeholder="e.g. 006208.TW">
+  <label for="from">From (YYYY-MM-DD)</label>
+  <input id="from" value="2018-01-01">
+  <label for="to">To (YYYY-MM-DD, blank = today)</label>
+  <input id="to" placeholder="">
+  <button id="run">Run scrape</button>
+</fieldset>
+
+<div id="log">Idle.</div>
+<div id="result"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const API = 'https://api.github.com';
+const WORKFLOW_FILE = 'scrape-on-demand.yml';
+const DEFAULT_FROM = '2018-01-01';
+
+// Same shapes the workflow validates against, checked here too so a typo is
+// caught before burning a runner minute.
+const SYMBOL_PATTERN = /^[A-Za-z0-9.^=-]{1,20}$/;
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+const RUN_APPEAR_ATTEMPTS = 20;
+const RUN_APPEAR_INTERVAL_MS = 3000;
+const RUN_POLL_ATTEMPTS = 240;
+const RUN_POLL_INTERVAL_MS = 5000;
+
+// Derived from the Pages URL so renaming the repo needs no code change; the
+// constants below are only the fallback for opening this file over file://.
+const FALLBACK_OWNER = 'Evaline8485';
+const FALLBACK_REPO = 'YahooFinScraper';
+
+function resolveRepo() {
+  const host = location.hostname.match(/^([^.]+)\.github\.io$/);
+  const firstSegment = location.pathname.split('/').filter(Boolean)[0];
+  if (host && firstSegment) return { owner: host[1], repo: firstSegment };
+  return { owner: FALLBACK_OWNER, repo: FALLBACK_REPO };
+}
+
+const { owner, repo } = resolveRepo();
+
+// Persist the token locally so it does not have to be pasted every visit. It
+// never leaves this browser except as an Authorization header to GitHub.
+const saved = localStorage.getItem('yfs_token');
+if (saved) $('token').value = saved;
+$('token').addEventListener('change', () => localStorage.setItem('yfs_token', $('token').value));
+
+function log(msg) {
+  $('log').textContent += '\n' + msg;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const safeFileName = (symbol) => symbol.replace(/[^a-zA-Z0-9.]/g, '_');
+
+async function ghFetch(path, opts = {}) {
+  return fetch(`${API}${path}`, {
+    ...opts,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      Authorization: `Bearer ${$('token').value.trim()}`,
+      ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(opts.headers || {}),
+    },
+  });
+}
+
+async function ghJson(path, opts = {}) {
+  const res = await ghFetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.message || `Request failed (${res.status})`);
+  return body;
+}
+
+// A successful dispatch is 204 with an empty body, so this one can't go
+// through ghJson.
+async function dispatchRun(inputs) {
+  const res = await ghFetch(
+    `/repos/${owner}/${repo}/actions/workflows/${WORKFLOW_FILE}/dispatches`,
+    { method: 'POST', body: JSON.stringify({ ref: 'main', inputs }) }
+  );
+  if (res.status === 204) return;
+
+  const body = await res.json().catch(() => ({}));
+  const hint = res.status === 401 || res.status === 403
+    ? ' (check the token is valid and has Actions: Read and write on this repo)'
+    : '';
+  throw new Error((body.message || `Dispatch failed (${res.status})`) + hint);
+}
+
+/** Finds our own run by the correlation token the workflow echoes into run-name. */
+async function findRun(runToken) {
+  const data = await ghJson(
+    `/repos/${owner}/${repo}/actions/workflows/${WORKFLOW_FILE}/runs` +
+    `?event=workflow_dispatch&per_page=20`
+  );
+  const runs = data.workflow_runs || [];
+  return runs.find((r) => (r.display_title || r.name || '').includes(runToken)) || null;
+}
+
+async function waitForRun(runToken) {
+  for (let i = 0; i < RUN_APPEAR_ATTEMPTS; i++) {
+    await sleep(RUN_APPEAR_INTERVAL_MS);
+    const run = await findRun(runToken);
+    if (run) return run;
+  }
+  throw new Error('Timed out waiting for the run to appear — check the Actions tab.');
+}
+
+async function waitForCompletion(initialRun) {
+  let run = initialRun;
+  for (let i = 0; i < RUN_POLL_ATTEMPTS && run.status !== 'completed'; i++) {
+    await sleep(RUN_POLL_INTERVAL_MS);
+    run = await ghJson(`/repos/${owner}/${repo}/actions/runs/${run.id}`);
+    log(`Status: ${run.status}...`);
+  }
+  if (run.status !== 'completed') {
+    throw new Error(`Run still ${run.status} after waiting — see ${run.html_url}`);
+  }
+  if (run.conclusion !== 'success') {
+    throw new Error(`Run finished with conclusion "${run.conclusion}". See ${run.html_url}`);
+  }
+  return run;
+}
+
+/**
+ * raw.githubusercontent.com caches hard, so the just-committed file needs a
+ * cache-busting query param to come back fresh.
+ */
+async function buildDownloadLink(fileName) {
+  const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/csv/${fileName}?t=${Date.now()}`;
+  const res = await fetch(rawUrl);
+  if (!res.ok) throw new Error(`Could not fetch csv/${fileName} (${res.status})`);
+
+  const blob = new Blob([await res.text()], { type: 'text/csv' });
+  const link = document.createElement('a');
+  link.className = 'download';
+  link.href = URL.createObjectURL(blob);
+  link.download = fileName;
+  link.textContent = `Download ${fileName}`;
+  return link;
+}
+
+function readForm() {
+  const token = $('token').value.trim();
+  const symbol = $('symbol').value.trim();
+  const from = $('from').value.trim() || DEFAULT_FROM;
+  const to = $('to').value.trim();
+
+  if (!token) throw new Error('Paste your GitHub token first.');
+  if (!SYMBOL_PATTERN.test(symbol)) {
+    throw new Error('Enter a ticker symbol, e.g. 006208.TW');
+  }
+  for (const d of [from, to].filter(Boolean)) {
+    if (!DATE_PATTERN.test(d)) throw new Error(`Dates must be YYYY-MM-DD — got "${d}"`);
+  }
+  if (to && to < from) throw new Error('"To" date is before the "From" date.');
+
+  return { symbol, from, to };
+}
+
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
+  $('result').replaceChildren();
+  $('log').textContent = '';
+
+  try {
+    const { symbol, from, to } = readForm();
+    const runToken = crypto.randomUUID();
+
+    log(`Dispatching workflow for ${symbol} (${from} → ${to || 'today'})...`);
+    await dispatchRun({ symbol, from, to, run_id: runToken });
+    log('Workflow dispatched. Waiting for it to start...');
+
+    const run = await waitForRun(runToken);
+    log(`Run started: ${run.html_url}`);
+
+    await waitForCompletion(run);
+    log('Scrape complete. Fetching CSVs...');
+
+    const base = safeFileName(symbol);
+    for (const name of [`${base}_history_daily.csv`, `${base}_history_monthly.csv`]) {
+      $('result').append(await buildDownloadLink(name));
+    }
+    log('Done.');
+  } catch (err) {
+    log(`Error: ${err.message}`);
+  } finally {
+    $('run').disabled = false;
+  }
+});
+</script>
+
+</body>
+</html>

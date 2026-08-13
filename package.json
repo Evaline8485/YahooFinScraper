@@ -1,0 +1,14 @@
+{
+  "name": "yahoofinscraper",
+  "version": "1.0.0",
+  "description": "On-demand Yahoo Finance history scraper, driven from a GitHub Pages dashboard",
+  "main": "scrape_history_page.js",
+  "scripts": {
+    "scrape": "node scrape_history_page.js"
+  },
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.61.0"
+  }
+}

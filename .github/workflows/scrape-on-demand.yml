@@ -1,0 +1,117 @@
+name: Scrape on demand
+
+# Triggered from docs/index.html (the GitHub Pages dashboard) through the
+# workflow_dispatch REST API, using the caller's own fine-grained PAT.
+#
+# `run_id` is an opaque token the page mints before dispatching. The dispatch
+# API answers 204 with no body, so there is no way to learn the real run id
+# from the response — echoing the token into `run-name` puts it in the run's
+# display_title, which the page then matches on to find *this* run rather than
+# whichever run happens to be newest.
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Ticker symbol, e.g. 2330.TW'
+        required: true
+      from:
+        description: 'History start date (YYYY-MM-DD)'
+        required: false
+        default: '2018-01-01'
+      to:
+        description: 'History end date (YYYY-MM-DD, blank = today)'
+        required: false
+        default: ''
+      run_id:
+        description: 'Opaque correlation id set by the caller'
+        required: true
+
+run-name: Scrape ${{ inputs.symbol }} (${{ inputs.run_id }})
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install chromium
+
+      # Inputs arrive from a browser, so they are treated as untrusted: they go
+      # in through env rather than being interpolated into the script body, and
+      # the symbol is validated before it reaches a shell or $GITHUB_OUTPUT.
+      - name: Resolve date range and build history URL
+        id: vars
+        env:
+          SYMBOL: ${{ inputs.symbol }}
+          FROM_DATE: ${{ inputs.from }}
+          TO_DATE: ${{ inputs.to }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "$SYMBOL" | grep -Eq '^[A-Za-z0-9.^=-]{1,20}$'; then
+            echo "Refusing to scrape unexpected symbol: $SYMBOL" >&2
+            exit 1
+          fi
+
+          FROM="${FROM_DATE:-2018-01-01}"
+          TO="$TO_DATE"
+          if [ -z "$TO" ]; then TO=$(date -u +%Y-%m-%d); fi
+
+          for d in "$FROM" "$TO"; do
+            if ! printf '%s' "$d" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+              echo "Refusing to scrape unexpected date: $d" >&2
+              exit 1
+            fi
+          done
+
+          # BSD date on the macOS runner; the GNU form is a fallback so this
+          # still works if the job is ever moved to ubuntu. The time of day is
+          # spelled out because BSD date fills unspecified fields from *now*,
+          # which would make the boundary days depend on when the job ran.
+          PERIOD1=$(date -u -jf "%Y-%m-%d %H:%M:%S" "$FROM 00:00:00" +%s 2>/dev/null || date -u -d "$FROM 00:00:00" +%s)
+          PERIOD2=$(date -u -jf "%Y-%m-%d %H:%M:%S" "$TO 23:59:59" +%s 2>/dev/null || date -u -d "$TO 23:59:59" +%s)
+
+          echo "Scraping $SYMBOL from $FROM to $TO"
+          echo "url=https://finance.yahoo.com/quote/${SYMBOL}/history/?period1=${PERIOD1}&period2=${PERIOD2}" >> "$GITHUB_OUTPUT"
+
+      - name: Run scraper
+        env:
+          HISTORY_URL: ${{ steps.vars.outputs.url }}
+        run: node scrape_history_page.js "$HISTORY_URL"
+
+      - name: Commit resulting CSVs
+        env:
+          SYMBOL: ${{ inputs.symbol }}
+          RUN_TOKEN: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add csv/
+          if git diff --cached --quiet; then
+            echo "No CSV changes to commit"
+            exit 0
+          fi
+          git commit -m "Scrape ${SYMBOL} (run ${RUN_TOKEN})"
+
+          # A concurrent dispatch may have pushed while this job was scraping.
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "Push rejected — rebasing onto origin/main (attempt ${attempt})"
+            git pull --rebase origin main
+          done
+
+          echo "Could not push after 3 attempts" >&2
+          exit 1
